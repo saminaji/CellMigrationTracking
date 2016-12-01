@@ -273,12 +273,54 @@ def harris_corner(image, maxCorner, qualityLevel, minDistance):
                                       )
     return corners
 
+# find blobs in images
+def blob_seg(image):
+    params = cv2.SimpleBlobDetector_Params()
+
+    # Change thresholds
+    params.minThreshold = 20
+    params.maxThreshold = 200
+
+    # Filter by Area.
+    params.filterByArea = True
+    params.minArea = 20
+
+    # Filter by Circularity
+    params.filterByCircularity = True
+    params.minCircularity = 0.3
+
+    # Filter by Convexity
+    params.filterByConvexity = True
+    params.minConvexity = 0.50
+
+    # Filter by Inertia
+    params.filterByInertia = True
+    params.minInertiaRatio = 0.01
+    # Filter by Color
+    params.blobColor = 255
+    params.filterByColor = True
+    # Create a detector with the parameters
+    detector = cv2.SimpleBlobDetector(params)
+
+    # Detect blobs.
+    keypoints = detector.detect(image)
+
+    pts = [[[np.float32(np.hstack(keypoints[idx].pt))]] for idx in range(len(keypoints))]
+    pts = np.vstack(pts)
+
+    return pts, keypoints
+
+
 def basic_tracking(self, frames, old_gray_image1, intialPoints, segMeth, maxCorner, qualityLevel, minDistance,
                  updateconvax, progessbar, timelapse, line = False, ID = False):
 
     old_gray_image2 = cv2.cvtColor(old_gray_image1, cv2.COLOR_BGR2GRAY)
     old_gray_image2 = histogram_equaliz(old_gray_image2)
 
+    feature_params = dict(maxCorners=maxCorner,
+                          qualityLevel=qualityLevel,
+                          minDistance=minDistance,
+                          blockSize=7)
 
     Initialtime = timelapse
     mask = np.zeros_like(old_gray_image1,)
@@ -301,16 +343,20 @@ def basic_tracking(self, frames, old_gray_image1, intialPoints, segMeth, maxCorn
     neigh = NearestNeighbors(n_neighbors=1)
     neigh.fit(firstDetections)
 
-    mask = np.zeros_like(old_gray_image, )
+    mask = np.zeros_like(old_gray_image1, )
     trajectoriesX, trajectoriesY, cellIDs, frameID, t = [], [], [], [], []
 
     for i, frame in enumerate(frames):
         try:
-            new_gray_image = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-            # perform histogram equalization to balance image color intensity
-            new_gray_image = histogram_equaliz(new_gray_image)
 
-            p1 = cv2.goodFeaturesToTrack(frame, mask=None, **feature_params)
+            if segMeth == 'blob':
+                p1,_ = blob_seg(frame)
+            else:
+                new_gray_image = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+                # perform histogram equalization to balance image color intensity
+                new_gray_image = histogram_equaliz(new_gray_image)
+
+                p1 = cv2.goodFeaturesToTrack(new_gray_image, mask=None, **feature_params)
 
             good_new = []
 
@@ -369,8 +415,6 @@ def basic_tracking(self, frames, old_gray_image1, intialPoints, segMeth, maxCorn
                 img = cv2.add(frame, mask)
                 edged2 = np.hstack([mask, img])
 
-                # Now update the previous frame and previous points
-                old_gray_image2 = new_gray_image.copy()
 
                 intialPoints = good_new.reshape(-1, 1, 2)
                 # Keep the data of for later processing
@@ -481,6 +525,8 @@ def optical_flow(self, frames, old_gray_image1, intialPoints, segMeth, maxCorner
     # training a knn model
     firstDetections, updatedTrackIdx, updateDetections,old_trackIdx = [], [], [], []
     idx = 0
+    print intialPoints
+
     for row in intialPoints:
         r1 = row[0]
         g, d = r1.ravel()
@@ -513,7 +559,7 @@ def optical_flow(self, frames, old_gray_image1, intialPoints, segMeth, maxCorner
             good_old = intialPoints[state == 1]
 
             secondDetections = updateDetections
-
+            good_new2 = good_new
             if i > 0:
                 neigh = NearestNeighbors(n_neighbors=1)
                 neigh.fit(updateDetections)
@@ -521,28 +567,32 @@ def optical_flow(self, frames, old_gray_image1, intialPoints, segMeth, maxCorner
                 updatedTrackIdx = []
                 for tt, row in enumerate(good_new):
                     z, y = row.ravel()
-                    test = [z, y]
+                    test = np.hstack(np.float32([z, y]))
                     # find the closet point to the testing  in the training data
                     nearestpoint = neigh.kneighbors(test)
                     trackID = int(nearestpoint[1][0])
                     distance = float(nearestpoint[0][0])
+
+
+
                     if not distance:
-                        print 'I am empty', distance
-                        exit()
+                        good_new2 = np.delete(good_new, tt, 0)
+                    else:
+                        good_new2 = good_new
+
                     if distance > 15:
                         new_idx = old_trackIdx[-1] + 1
                         updatedTrackIdx.append(new_idx)
                         old_trackIdx.append(new_idx)
-                        updateDetections.append(np.hstack(test))
+                        updateDetections = np.vstack([updateDetections, test])
+                        secondDetections = np.vstack([secondDetections, test])
                     else:
                         updatedTrackIdx.append(trackID)
                         updateDetections[trackID] = test
 
+            cont = len(good_new2)
 
-
-            cont = len(good_new)
-
-            for ii, new in enumerate(good_new):
+            for ii, new in enumerate(good_new2):
 
                 cellId = updatedTrackIdx[ii]
 
@@ -645,6 +695,7 @@ def optical_flow(self, frames, old_gray_image1, intialPoints, segMeth, maxCorner
             updateconvax.update_idletasks()  # Force redraw
             updateconvax.delete(imagesprite)
 
+            # save the final plot of the trajectories
             if i == finalFrame - 1:
                 cv2.imwrite(os.path.join(trajectorydir, 'finalTrajectory.png'), img)
                 cv2.imwrite(os.path.join(trajectorydir, 'Plottrajector.png'), mask)
@@ -741,17 +792,14 @@ class Application:
 
        # 8.2: Entry
         self.cellEstimate = 200
-        self.minDistance = 20
+        self.minDistance = 40
 
         # 9: Perform segmentation
 
         self.preview = builder.get_object("Button_1")
 
         self.convax1 = builder.get_object("Canvas_4")
-#        self.convax_7 = builder.get_object("Canvas_7")
- #       self.convax_8 = builder.get_object("Canvas_8")
-   #     self.convax_9 = builder.get_object("Canvas_9")
-  #      self.convax_10 = builder.get_object("Canvas_10")
+
 
         self.segmentation = self.builder.get_variable("seg")
         self.color = self.builder.get_variable("background")
@@ -792,7 +840,6 @@ class Application:
             # Check for the file format
             if '.tif' in path:
                 tif = TIFF.open(path, mode='r')
-
 
                 try:
                     for cc, tframe in enumerate(tif.iter_images()):
@@ -837,37 +884,13 @@ class Application:
 
             # perform the actual resizing of the image and show it
             resized = cv2.resize(tmp_img, dim, interpolation=cv2.INTER_AREA)
-            '''resized1 = cv2.resize(self.frames[1], dim, interpolation=cv2.INTER_AREA)
-            resized2 = cv2.resize(self.frames[2], dim, interpolation=cv2.INTER_AREA)
-            resized3 = cv2.resize(self.frames[3], dim, interpolation=cv2.INTER_AREA)
-            resized4 = cv2.resize(self.frames[4], dim, interpolation=cv2.INTER_AREA)'''
             mahotas.imsave('raw_image.gif', resized)
-            '''mahotas.imsave('raw_image1.gif', resized1)
-            mahotas.imsave('raw_image2.gif', resized2)
-            mahotas.imsave('raw_image3.gif', resized3)
-            mahotas.imsave('raw_image4.gif', resized3)'''
             image1 = img2.open('raw_image.gif')
-            '''image2 = img2.open('raw_image1.gif')
-            image3 = img2.open('raw_image2.gif')
-            image4 = img2.open('raw_image3.gif')
-            image5 = img2.open('raw_image4.gif')'''
+
 
             image1 = ImageTk.PhotoImage(image1)
             root.image1 = image1
             _ = self.convax1.create_image(263, 187, image=image1)
-
-            '''image2 = ImageTk.PhotoImage(image2)
-            root.image2 = image2
-            image3 = ImageTk.PhotoImage(image3)
-            root.image3 = image3
-            image4 = ImageTk.PhotoImage(image4)
-            root.image4 = image4
-            image5 = ImageTk.PhotoImage(image5)
-            root.image5 = image5
-            _ = self.convax_7.create_image(100, 70, image=image2)
-            _ = self.convax_8.create_image(100, 70, image=image2)
-            _ = self.convax_9.create_image(100, 70, image=image2)
-            _ = self.convax_10.create_image(100, 70, image=image2)'''
 
         else:
             tkMessageBox.showinfo("No file", "Choose a file to process")
@@ -968,7 +991,26 @@ class Application:
                 tmp_pre = ImageTk.PhotoImage(tmp_pre)
                 root.tmp_pre = tmp_pre
                 segprev = self.preconvax.create_image(263,187, image=tmp_pre)
+
+            if self.segMethod == 1:
+                _, self.keypoints = blob_seg(self.frames[0])
+                self.im_with_keypoints = cv2.drawKeypoints(self.frames[0], self.keypoints, np.array([]), (0, 0, 255),
+                                                      cv2.DRAW_MATCHES_FLAGS_DRAW_RICH_KEYPOINTS)
+
+
+
+                r = 500.0 / self.im_with_keypoints.shape[1]
+                dim = (500, int(self.im_with_keypoints.shape[0] * r))
+
+                # perform the actual resizing of the image and show it
+                self.prev_image = cv2.resize(self.im_with_keypoints, dim, interpolation=cv2.INTER_AREA)
+                mahotas.imsave('SegImage.gif', self.prev_image)
+                tmp_pre = img2.open('SegImage.gif')
+                tmp_pre = ImageTk.PhotoImage(tmp_pre)
+                root.tmp_pre = tmp_pre
+                segprev = self.preconvax.create_image(263,187, image=tmp_pre)
             return self.segMethod
+
         else:
             tkMessageBox.showinfo('No file', 'no data is found!!!')
 
@@ -997,14 +1039,11 @@ class Application:
             else:
                 self.CellID = False
 
-
-
             if self.frames:
                 self.normalizedImage = cv2.cvtColor(self.frames[0], cv2.COLOR_BGR2GRAY)
                 self.normalizedImage = histogram_equaliz(self.normalizedImage)
             else:
                 pass
-
 
             if self.segmentation.get() == 2:
                 if self.color.get() == 1:
@@ -1013,7 +1052,7 @@ class Application:
                     self.initialpoints = shi_tomasi(self.mask, int(self.cellEstimate.get()),
                                                     float(self.fixscale),
                                                     int(self.minDistance.get()))
-                    self.seg = 'black'
+                    self.seg = 'watershed'
                 if self.color.get() == 2:
                     self.mask = white_background(self.frames[0], self.kernel)
                     self.mask = cv2.cvtColor(self.mask, cv2.COLOR_BGR2GRAY)
@@ -1022,11 +1061,12 @@ class Application:
                     self.initialpoints = shi_tomasi(self.mask, int(self.cellEstimate.get()),
                                                     float(self.fixscale),
                                                     int(self.minDistance.get()))
-                    self.seg = 'white'
+                    self.seg = 'watershed'
             if self.segmentation.get() == 3:
                 self.initialpoints = harris_corner(self.normalizedImage, int(self.cellEstimate.get()), float(self.fixscale),
                                                    int(self.minDistance.get()))
                 self.seg = 'haris'
+
             if self.segmentation.get() == 4:
                 self.initialpoints = shi_tomasi(self.normalizedImage, int(self.cellEstimate.get()), float(self.fixscale),
                                                 int(self.minDistance.get()))
@@ -1036,9 +1076,12 @@ class Application:
                 self.mask =  basic_seg(self.frames[0], self.frames)
                 self.initialpoints = shi_tomasi(self.mask, int(self.cellEstimate.get()), float(self.fixscale),
                                                 int(self.minDistance.get()))
-
-
                 self.seg = 'basic'
+
+            if self.segmentation.get() == 1:
+                self.initialpoints,_ =  blob_seg(self.frames[0])
+                self.seg = 'blob'
+
 
             # manipulate a tracking method
 
@@ -1047,10 +1090,107 @@ class Application:
 
                 optical_flow(self, self.frames[1:], self.frames[0], self.initialpoints, str(self.seg),
                              int(self.cellEstimate.get()), float(self.fixscale), int(self.minDistance.get()), self.trackconvax, self.progressdialog2, self.timelapse, line=self.Traj, ID=self.CellID, )
+            if self.track.get() == 9:
+                tkMessageBox.showinfo('..', 'Segmentation method: %s \n' % self.seg, )
 
+                basic_tracking(self, self.frames[1:], self.frames[0], self.initialpoints, str(self.seg),
+                             int(self.cellEstimate.get()), float(self.fixscale), int(self.minDistance.get()),
+                             self.trackconvax, self.progressdialog2, self.timelapse, line=self.Traj,
+                             ID=self.CellID, )
 
         else:
             tkMessageBox.showinfo('Missing data', 'no data to process')
+
+
+
+        def track_on_click(self):
+            if self.frames:
+                self.cellEstimate = self.builder.get_object('Entry_1')
+                self.minDistance = self.builder.get_object('Entry_3')
+
+                self.timelapse = self.builder.get_object("Entry_2")
+
+                self.timelapse = int(self.timelapse.get())
+
+                self.TrajectoryColor = self.builder.get_variable("2")
+                self.ID = self.builder.get_variable("0")
+
+                if self.TrajectoryColor.get() == 1:
+                    self.Traj = True
+                else:
+                    self.Traj = False
+
+                if self.ID.get() == 1:
+                    self.CellID = True
+                else:
+                    self.CellID = False
+
+                if self.frames:
+                    self.normalizedImage = cv2.cvtColor(self.frames[0], cv2.COLOR_BGR2GRAY)
+                    self.normalizedImage = histogram_equaliz(self.normalizedImage)
+                else:
+                    pass
+
+                if self.segmentation.get() == 2:
+                    if self.color.get() == 1:
+                        self.mask = black_background(self.frames[0], self.kernel)
+                        # self.mask = histogram_equaliz(self.mask)
+                        self.initialpoints = shi_tomasi(self.mask, int(self.cellEstimate.get()),
+                                                        float(self.fixscale),
+                                                        int(self.minDistance.get()))
+                        self.seg = 'watershed'
+                    if self.color.get() == 2:
+                        self.mask = white_background(self.frames[0], self.kernel)
+                        self.mask = cv2.cvtColor(self.mask, cv2.COLOR_BGR2GRAY)
+                        self.mask = histogram_equaliz(self.mask)
+
+                        self.initialpoints = shi_tomasi(self.mask, int(self.cellEstimate.get()),
+                                                        float(self.fixscale),
+                                                        int(self.minDistance.get()))
+                        self.seg = 'watershed'
+                if self.segmentation.get() == 3:
+                    self.initialpoints = harris_corner(self.normalizedImage, int(self.cellEstimate.get()),
+                                                       float(self.fixscale),
+                                                       int(self.minDistance.get()))
+                    self.seg = 'haris'
+                if self.segmentation.get() == 4:
+                    self.initialpoints = shi_tomasi(self.normalizedImage, int(self.cellEstimate.get()),
+                                                    float(self.fixscale),
+                                                    int(self.minDistance.get()))
+                    self.seg = 'shi'
+
+                if self.segmentation.get() == 5:
+                    self.mask = basic_seg(self.frames[0], self.frames)
+                    self.initialpoints = shi_tomasi(self.mask, int(self.cellEstimate.get()), float(self.fixscale),
+                                                    int(self.minDistance.get()))
+
+                    self.seg = 'basic'
+
+                if self.segmentation.get() == 6:
+                    self.initialpoints,_ = basic_seg(self.frames[0])
+                    self.seg = 'blob'
+
+
+                # manipulate a tracking method
+
+                if self.track.get() == 8:
+                    tkMessageBox.showinfo('..', 'Segmentation method: %s \n' % self.seg, )
+
+                    optical_flow(self, self.frames[1:], self.frames[0], self.initialpoints, str(self.seg),
+                                 int(self.cellEstimate.get()), float(self.fixscale), int(self.minDistance.get()),
+                                 self.trackconvax, self.progressdialog2, self.timelapse, line=self.Traj,
+                                 ID=self.CellID, )
+
+                if self.track.get() == 9:
+                    tkMessageBox.showinfo('..', 'Segmentation method: %s \n' % self.seg, )
+
+                    optical_flow(self, self.frames[1:], self.frames[0], self.initialpoints, str(self.seg),
+                                 int(self.cellEstimate.get()), float(self.fixscale), int(self.minDistance.get()),
+                                 self.trackconvax, self.progressdialog2, self.timelapse, line=self.Traj,
+                                 ID=self.CellID, )
+            else:
+                tkMessageBox.showinfo('Missing data', 'no data to process')
+
 
     # scale
     def on_scale_click(self, event):
@@ -1097,7 +1237,6 @@ class Application:
             ##from images2gif import writeGif
             #print os.path.basename(filename)
             #writeGif('/home/sami/animation.gif', frames, duration=original_duration / 1000.0, dither=0)
-
 
     def savefile(self):
         name = asksaveasfilename(initialdir=csvdir)
